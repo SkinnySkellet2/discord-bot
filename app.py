@@ -56,15 +56,37 @@ async def has_existing_ticket(guild, user, ticket_type):
 async def has_any_existing_ticket(guild, user):
     """Checks if user already has any open ticket."""
     user_name_lower = user.name.lower().replace(" ", "-")
+    user_id = str(user.id)
+    
+    print(f"Checking tickets for user: {user.name} (ID: {user_id})")  # Debug
     
     for channel in guild.text_channels:
         channel_name_lower = channel.name.lower()
         
-        # Check if this is any ticket channel for this user
-        if (channel_name_lower.startswith("ticket-") and 
-            user_name_lower in channel_name_lower):
-            return channel
+        print(f"Checking channel: {channel_name_lower}")  # Debug
+        
+        # Check multiple patterns for ticket channels
+        if channel_name_lower.startswith("ticket-"):
+            # Pattern 1: ticket-type-username
+            if user_name_lower in channel_name_lower:
+                print(f"Found existing ticket by username: {channel.name}")  # Debug
+                return channel
+            
+            # Pattern 2: ticket-type-userid
+            if user_id in channel_name_lower:
+                print(f"Found existing ticket by user ID: {channel.name}")  # Debug
+                return channel
+            
+            # Pattern 3: Check channel permissions (most reliable)
+            # If user has specific permissions in a ticket channel, it's likely their ticket
+            overwrites = channel.overwrites_for(user)
+            if overwrites.read_messages is True and overwrites.send_messages is not None:
+                # Check if this looks like a ticket channel for this user
+                if any(word in channel_name_lower for word in ["ticket", "support", "report", "unban"]):
+                    print(f"Found existing ticket by permissions: {channel.name}")  # Debug
+                    return channel
     
+    print("No existing tickets found")  # Debug
     return None
 
 async def create_ticket_channel(guild, user, ticket_type, support_role_names):
@@ -98,24 +120,25 @@ async def create_ticket_channel(guild, user, ticket_type, support_role_names):
     if TICKET_CATEGORY_ID:
         category = guild.get_channel(TICKET_CATEGORY_ID)
     
-    # Create the channel
+    # Create the channel WITHOUT user ID in name
     channel_name = f"ticket-{ticket_type}-{user.name}".lower().replace(" ", "-")
     channel = await guild.create_text_channel(
         name=channel_name,
         overwrites=overwrites,
         category=category,
-        topic=f"Support Ticket für {user.display_name} - {ticket_type}"
+        topic=f"Support Ticket für {user.display_name} (ID: {user.id}) - {ticket_type}"
     )
     
+    print(f"Created ticket channel: {channel.name} for user {user.name} (ID: {user.id})")  # Debug
     return channel
 
 class TicketCloseView(discord.ui.View):
-    """View with a close button for ticket channels."""
+    """View with close and delete buttons for ticket channels."""
     
     def __init__(self):
         super().__init__(timeout=None)
     
-    @discord.ui.button(label="🔒 Ticket schließen", style=discord.ButtonStyle.red, custom_id="close_ticket")
+    @discord.ui.button(label="🔒 Ticket schließen", style=discord.ButtonStyle.secondary, custom_id="close_ticket")
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             # Check permissions for closing tickets
@@ -142,38 +165,115 @@ class TicketCloseView(discord.ui.View):
                     if allowed:
                         break
             
-            # Check if user is the ticket creator (channel name contains their name)
-            if not allowed and interaction.user.name.lower() in interaction.channel.name:
+            # Check if user is the ticket creator - MORE RELIABLE CHECK
+            is_ticket_creator = False
+            
+            # Method 1: Check channel name
+            if interaction.user.name.lower() in interaction.channel.name.lower():
+                is_ticket_creator = True
+            
+            # Method 2: Check channel topic for user ID
+            if interaction.channel.topic and str(interaction.user.id) in interaction.channel.topic:
+                is_ticket_creator = True
+            
+            # Method 3: Check channel permissions
+            user_perms = interaction.channel.overwrites_for(interaction.user)
+            if user_perms.read_messages is True and user_perms.send_messages is True:
+                is_ticket_creator = True
+            
+            if not allowed and is_ticket_creator:
                 allowed = True
             
             if not allowed:
                 await interaction.response.send_message("❌ Du hast keine Berechtigung, dieses Ticket zu schließen!", ephemeral=True)
                 return
             
-            # If it's the ticket creator, just close but don't delete
-            if interaction.user.name.lower() in interaction.channel.name and not any(role in user_roles for role in ADMIN_ROLES + list(sum([[r] if isinstance(r, str) else r for r in SUPPORT_ROLES.values()], []))):
-                embed = discord.Embed(
-                    title="🔒 Ticket geschlossen",
-                    description=f"Dieses Ticket wurde von {interaction.user.mention} geschlossen.\n\nNur Admins und Support-Rollen können das Ticket löschen.",
-                    color=discord.Color.orange()
-                )
-                await interaction.response.send_message(embed=embed)
-                
-                # Remove permissions for the ticket creator
-                overwrites = interaction.channel.overwrites
-                overwrites[interaction.user] = discord.PermissionOverwrite(read_messages=True, send_messages=False)
-                await interaction.channel.edit(overwrites=overwrites)
-                return
+            # Close ticket (remove write permissions for ticket creator)
+            embed = discord.Embed(
+                title="🔒 Ticket geschlossen",
+                description=f"Dieses Ticket wurde von {interaction.user.mention} geschlossen.\n\nDas Ticket kann mit dem 🗑️ Button gelöscht werden.",
+                color=discord.Color.orange()
+            )
+            await interaction.response.send_message(embed=embed)
             
-            # Support roles and admins can delete the ticket
-            await interaction.response.send_message("🔒 Ticket wird in 5 Sekunden gelöscht...", ephemeral=False)
-            await asyncio.sleep(5)
-            await interaction.channel.delete(reason=f"Ticket gelöscht von {interaction.user}")
+            # Remove write permissions for the ticket creator if they exist
+            overwrites = interaction.channel.overwrites
+            for user_or_role, perms in overwrites.items():
+                if isinstance(user_or_role, discord.Member) and user_or_role != interaction.guild.me:
+                    # Check if this is likely the ticket creator
+                    if (user_or_role.name.lower() in interaction.channel.name.lower() or 
+                        (interaction.channel.topic and str(user_or_role.id) in interaction.channel.topic)):
+                        overwrites[user_or_role] = discord.PermissionOverwrite(read_messages=True, send_messages=False)
+            
+            await interaction.channel.edit(overwrites=overwrites)
             
         except Exception as e:
             print(f"Error in close_ticket: {e}")
             if not interaction.response.is_done():
                 await interaction.response.send_message("❌ Fehler beim Schließen des Tickets. Versuche es erneut.", ephemeral=True)
+
+    @discord.ui.button(label="🗑️ Ticket löschen", style=discord.ButtonStyle.red, custom_id="delete_ticket")
+    async def delete_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            # Check if user is the ticket creator - they CANNOT delete
+            is_ticket_creator = False
+            
+            # Method 1: Check channel name
+            if interaction.user.name.lower() in interaction.channel.name.lower():
+                is_ticket_creator = True
+            
+            # Method 2: Check channel topic for user ID
+            if interaction.channel.topic and str(interaction.user.id) in interaction.channel.topic:
+                is_ticket_creator = True
+            
+            # Method 3: Check if user has specific ticket creator permissions
+            user_perms = interaction.channel.overwrites_for(interaction.user)
+            if (user_perms.read_messages is True and user_perms.send_messages is not None and 
+                not any(role.name in [role for roles in SUPPORT_ROLES.values() for role in (roles if isinstance(roles, list) else [roles])] + ADMIN_ROLES for role in interaction.user.roles)):
+                is_ticket_creator = True
+            
+            # Ticket creator cannot delete
+            if is_ticket_creator:
+                await interaction.response.send_message("❌ Als Ticket-Ersteller kannst du das Ticket nicht löschen! Nur Support-Rollen und Admins können Tickets löschen.", ephemeral=True)
+                return
+            
+            # Check if user has permission to delete (all roles that have access to the ticket)
+            allowed = False
+            user_roles = [role.name for role in interaction.user.roles]
+            
+            # Check if user has admin roles (OWNER, Admin) - they are pinged in all tickets
+            for admin_role in ADMIN_ROLES:
+                if admin_role in user_roles:
+                    allowed = True
+                    break
+            
+            # Check if user has any support role that gets pinged in tickets
+            if not allowed:
+                for ticket_type, support_roles in SUPPORT_ROLES.items():
+                    # Handle both single role (string) and multiple roles (list)
+                    if isinstance(support_roles, str):
+                        support_roles = [support_roles]
+                    
+                    for support_role in support_roles:
+                        if support_role in user_roles:
+                            allowed = True
+                            break
+                    if allowed:
+                        break
+            
+            if not allowed:
+                await interaction.response.send_message("❌ Du hast keine Berechtigung, Tickets zu löschen! Nur gepingte Rollen (Support-Teams und Admins) können Tickets löschen.", ephemeral=True)
+                return
+            
+            # Delete the ticket
+            await interaction.response.send_message("🗑️ Ticket wird in 5 Sekunden gelöscht...", ephemeral=False)
+            await asyncio.sleep(5)
+            await interaction.channel.delete(reason=f"Ticket gelöscht von {interaction.user}")
+            
+        except Exception as e:
+            print(f"Error in delete_ticket: {e}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❌ Fehler beim Löschen des Tickets. Versuche es erneut.", ephemeral=True)
 
 # --- Discord UI Components (Buttons) ---
 
